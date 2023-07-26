@@ -1,4 +1,5 @@
 #if os(iOS) || os(tvOS)
+import CoreImage
 import UIKit
 import XCTest
 
@@ -114,9 +115,15 @@ private func compare(_ old: UIImage, _ new: UIImage, precision: Float, perceptua
     return "Newly-taken snapshot does not match reference."
   }
   if perceptualPrecision < 1, #available(iOS 11.0, tvOS 11.0, *) {
+    guard let oldCIImage = CIImage(image: old) else {
+      return "Reference image could not be loaded [CIImage]."
+    }
+    guard let newCIImage = CIImage(image: new) else {
+      return "Newly-taken snapshot could not be loaded [CIImage]."
+    }
     return perceptuallyCompare(
-      CIImage(cgImage: oldCgImage),
-      CIImage(cgImage: newCgImage),
+      oldCIImage,
+      newCIImage,
       pixelPrecision: precision,
       perceptualPrecision: perceptualPrecision
     )
@@ -174,7 +181,20 @@ import MetalPerformanceShaders
 
 @available(iOS 10.0, tvOS 10.0, macOS 10.13, *)
 func perceptuallyCompare(_ old: CIImage, _ new: CIImage, pixelPrecision: Float, perceptualPrecision: Float) -> String? {
-  let deltaOutputImage = old.applyingFilter("CILabDeltaE", parameters: ["inputImage2": new])
+  guard nil != MTLCreateSystemDefaultDevice() else {
+    return "Failed to compare snapshots. Metal is required for perceptuallyCompare, but not available on this machine."
+  }
+  guard let filter = CIFilter(name: "CILabDeltaE") else {
+    preconditionFailure("Didn't find CILabDeltaE filter")
+  }
+  filter.setDefaults()
+  filter.setValue(old, forKey: kCIInputImageKey)
+  filter.setValue(new, forKey: "inputImage2")
+
+  guard let deltaOutputImage = filter.outputImage else {
+    preconditionFailure("Failed to retrieve outputImage from CILabDeltaE filter")
+  }
+//  let deltaOutputImage = old.applyingFilter("CILabDeltaE", parameters: ["inputImage2": new])
   let thresholdOutputImage: CIImage
   do {
     thresholdOutputImage = try ThresholdImageProcessorKernel.apply(
@@ -186,7 +206,8 @@ func perceptuallyCompare(_ old: CIImage, _ new: CIImage, pixelPrecision: Float, 
     return "Newly-taken snapshot's data could not be loaded. \(error)"
   }
   var averagePixel: Float = 0
-  let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+//  let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+  let context = CIContext(options: [:])
   context.render(
     thresholdOutputImage.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: new.extent]),
     toBitmap: &averagePixel,
@@ -196,7 +217,10 @@ func perceptuallyCompare(_ old: CIImage, _ new: CIImage, pixelPrecision: Float, 
     colorSpace: nil
   )
   let actualPixelPrecision = 1 - averagePixel
-  guard actualPixelPrecision < pixelPrecision else { return nil }
+  guard actualPixelPrecision < pixelPrecision else {
+    print("ALL GOOD  - AVERAGE PIXEL IS WITHIN PARAMETERS")
+    return nil
+  }
   var maximumDeltaE: Float = 0
   context.render(
     deltaOutputImage.applyingFilter("CIAreaMaximum", parameters: [kCIInputExtentKey: new.extent]),
@@ -223,6 +247,10 @@ final class ThresholdImageProcessorKernel: CIImageProcessorKernel {
   static let inputThresholdKey = "thresholdValue"
   static let device = MTLCreateSystemDefaultDevice()
 
+  enum Error: Swift.Error {
+    case failedSetup
+  }
+
   override class func process(with inputs: [CIImageProcessorInput]?, arguments: [String: Any]?, output: CIImageProcessorOutput) throws {
     guard
       let device = device,
@@ -231,7 +259,7 @@ final class ThresholdImageProcessorKernel: CIImageProcessorKernel {
       let sourceTexture = input.metalTexture,
       let destinationTexture = output.metalTexture,
       let thresholdValue = arguments?[inputThresholdKey] as? Float else {
-      return
+      throw Error.failedSetup
     }
 
     let threshold = MPSImageThresholdBinary(
